@@ -59,10 +59,8 @@ test.describe("Optimistic Success Animation", () => {
     // Initially visible
     await expect(page.getByText("Payment Secured")).toBeVisible();
 
-    // After 5 seconds (our timeout is 4s) it should be gone
     await expect(page.getByText("Payment Secured")).not.toBeVisible({ timeout: 7000 });
     
-    // But the card should still show "This payment has been received."
     await expect(page.getByText("This payment has been received.")).toBeVisible();
   });
   
