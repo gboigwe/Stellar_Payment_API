@@ -11,6 +11,7 @@ const HORIZON_URL = (
 
 const server = new StellarSdk.Horizon.Server(HORIZON_URL);
 const HORIZON_HEALTH_TIMEOUT_MS = 2_000;
+const HORIZON_RETRY_DELAYS_MS = [150, 500];
 
 function parseStroops(value) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
@@ -19,6 +20,84 @@ function parseStroops(value) {
 
 function stroopsToXlm(stroops) {
   return (stroops / 10_000_000).toFixed(7);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getHorizonStatus(err) {
+  return err?.response?.status ?? err?.status ?? null;
+}
+
+function isRetryableHorizonError(err) {
+  const status = getHorizonStatus(err);
+  if (status === 408 || status === 429) {
+    return true;
+  }
+
+  if (typeof status === "number" && status >= 500) {
+    return true;
+  }
+
+  const code = String(err?.code || "").toUpperCase();
+  if (
+    [
+      "ECONNABORTED",
+      "ECONNREFUSED",
+      "ECONNRESET",
+      "ENETUNREACH",
+      "EHOSTUNREACH",
+      "ETIMEDOUT",
+      "UND_ERR_CONNECT_TIMEOUT",
+      "UND_ERR_SOCKET",
+    ].includes(code)
+  ) {
+    return true;
+  }
+
+  if (err?.name === "AbortError") {
+    return true;
+  }
+
+  return /timeout|temporar|network|socket|fetch failed/i.test(
+    String(err?.message || ""),
+  );
+}
+
+async function withHorizonRetry(operation, context = "") {
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= HORIZON_RETRY_DELAYS_MS.length; attempt += 1) {
+    try {
+      return await operation();
+    } catch (err) {
+      lastError = err;
+      if (!isRetryableHorizonError(err) || attempt === HORIZON_RETRY_DELAYS_MS.length) {
+        throw handleHorizonError(err, context);
+      }
+
+      await sleep(HORIZON_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+
+  throw handleHorizonError(lastError, context);
+}
+
+export function isValidStellarAccountId(value) {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return false;
+  }
+
+  return StellarSdk.StrKey.isValidEd25519PublicKey(value.trim());
+}
+
+export function isValidAssetCode(value) {
+  if (typeof value !== "string") {
+    return false;
+  }
+
+  return /^[A-Z0-9]{1,12}$/.test(value.trim().toUpperCase());
 }
 
 /**
@@ -140,7 +219,12 @@ export function resolveAsset(assetCode, assetIssuer) {
     throw new Error("Asset code is required");
   }
 
-  if (assetCode.toUpperCase() === "XLM") {
+  const normalizedCode = assetCode.toUpperCase();
+  if (!isValidAssetCode(normalizedCode)) {
+    throw new Error("Asset code must be 1-12 uppercase alphanumeric characters");
+  }
+
+  if (normalizedCode === "XLM") {
     return StellarSdk.Asset.native();
   }
 
@@ -148,7 +232,11 @@ export function resolveAsset(assetCode, assetIssuer) {
     throw new Error("Asset issuer is required for non-native assets");
   }
 
-  return new StellarSdk.Asset(assetCode.toUpperCase(), assetIssuer);
+  if (!isValidStellarAccountId(assetIssuer)) {
+    throw new Error("Asset issuer must be a valid Stellar public key");
+  }
+
+  return new StellarSdk.Asset(normalizedCode, assetIssuer);
 }
 
 function amountsMatch(expected, received) {
@@ -300,9 +388,20 @@ export async function findStrictReceivePaths({
   const sourceAsset = resolveAsset(sourceAssetCode, sourceAssetIssuer);
 
   try {
-    const result = await server
-      .strictReceivePaths([sourceAsset], destAsset, destAmount)
-      .call();
+    if (sourceAccount) {
+      await withHorizonRetry(
+        () => server.loadAccount(sourceAccount),
+        `source account ${sourceAccount}`,
+      );
+    }
+
+    const result = await withHorizonRetry(
+      () =>
+        server
+          .strictReceivePaths([sourceAsset], destAsset, destAmount)
+          .call(),
+      "strict-receive-paths",
+    );
 
     if (!result.records || result.records.length === 0) {
       return null;
@@ -310,6 +409,13 @@ export async function findStrictReceivePaths({
 
     // Return the best (first) path
     const best = result.records[0];
+    const sourceAmount = Number(best.source_amount);
+    if (!Number.isFinite(sourceAmount) || sourceAmount <= 0) {
+      const error = new Error("Horizon returned an invalid path payment quote");
+      error.status = 502;
+      throw error;
+    }
+
     return {
       source_amount: best.source_amount,
       source_asset_code:
@@ -322,6 +428,9 @@ export async function findStrictReceivePaths({
       })),
     };
   } catch (err) {
+    if (err?.status) {
+      throw err;
+    }
     throw handleHorizonError(err, "strict-receive-paths");
   }
 }
@@ -340,14 +449,18 @@ export async function findMatchingPayment({
 
   let page;
   try {
-    page = await server
-      .payments()
-      .forAccount(recipient)
-      .order("desc")
-      .limit(200)
-      .call();
+    page = await withHorizonRetry(
+      () =>
+        server
+          .payments()
+          .forAccount(recipient)
+          .order("desc")
+          .limit(200)
+          .call(),
+      recipient,
+    );
   } catch (err) {
-    throw handleHorizonError(err, recipient);
+    throw err?.status ? err : handleHorizonError(err, recipient);
   }
 
   // Check if recipient is multi-sig for enhanced verification
@@ -384,10 +497,14 @@ export async function findMatchingPayment({
     // If a memo is expected, fetch the parent transaction and compare
     if (memo != null && memo !== "") {
       try {
-        const tx = await server
-          .transactions()
-          .transaction(payment.transaction_hash)
-          .call();
+        const tx = await withHorizonRetry(
+          () =>
+            server
+              .transactions()
+              .transaction(payment.transaction_hash)
+              .call(),
+          `transaction ${payment.transaction_hash}`,
+        );
 
         if (!memoMatches(tx, memo, memoType)) {
           continue;
@@ -429,7 +546,10 @@ export async function findAnyRecentPayment({
 
   let page;
   try {
-    page = await server.payments().forAccount(recipient).order("desc").limit(100).call();
+    page = await withHorizonRetry(
+      () => server.payments().forAccount(recipient).order("desc").limit(100).call(),
+      recipient,
+    );
   } catch {
     return null;
   }
@@ -588,9 +708,12 @@ export async function verifyTransactionSignature(txHash) {
   // ── Step 1: Fetch transaction envelope from Horizon ──────────────────────
   let tx;
   try {
-    tx = await server.transactions().transaction(txHash).call();
+    tx = await withHorizonRetry(
+      () => server.transactions().transaction(txHash).call(),
+      `transaction ${txHash}`,
+    );
   } catch (err) {
-    const wrapped = handleHorizonError(err, `transaction ${txHash}`);
+    const wrapped = err?.status ? err : handleHorizonError(err, `transaction ${txHash}`);
     console.error(`verifyTransactionSignature: failed to fetch tx ${txHash}: ${wrapped.message}`);
     return {
       valid: false,
@@ -631,7 +754,10 @@ export async function verifyTransactionSignature(txHash) {
   const sourceAccountId = transaction.source;
   let accountData;
   try {
-    accountData = await server.loadAccount(sourceAccountId);
+    accountData = await withHorizonRetry(
+      () => server.loadAccount(sourceAccountId),
+      `source account ${sourceAccountId}`,
+    );
   } catch (err) {
     // Non-fatal: if we cannot load the account we cannot verify weights.
     // Return valid=false so the caller can decide whether to skip or retry.
