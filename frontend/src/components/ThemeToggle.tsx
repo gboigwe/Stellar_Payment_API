@@ -2,12 +2,16 @@
 
 import { useThemeState, useThemeActions } from "@/lib/theme-context";
 import { useCallback, useEffect, useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 
 export default function ThemeToggle() {
   const { theme, resolvedTheme, isMounted, isLoading, error } = useThemeState();
   const { toggleTheme, clearError } = useThemeActions();
   const [announcement, setAnnouncement] = useState<string>("");
+  // Honour the user's reduced-motion preference so the icon swap doesn't
+  // animate for people who find motion distracting (a standard a11y audit item).
+  const shouldReduceMotion = useReducedMotion();
+  const iconTransition = { duration: shouldReduceMotion ? 0 : 0.2 };
 
   const handleThemeToggle = useCallback(() => {
     if (error) {
@@ -94,7 +98,6 @@ export default function ThemeToggle() {
         aria-describedby="theme-description"
         title={getTitle()}
         disabled={isLoading}
-        role="button"
       >
       <AnimatePresence mode="wait" initial={false}>
         {error ? (
@@ -103,7 +106,7 @@ export default function ThemeToggle() {
             initial={{ scale: 0.5, opacity: 0, rotate: -45 }}
             animate={{ scale: 1, opacity: 1, rotate: 0 }}
             exit={{ scale: 0.5, opacity: 0, rotate: 45 }}
-            transition={{ duration: 0.2 }}
+            transition={iconTransition}
             xmlns="http://www.w3.org/2000/svg"
             fill="none"
             viewBox="0 0 24 24"
@@ -123,7 +126,7 @@ export default function ThemeToggle() {
             initial={{ scale: 0.5, opacity: 0, rotate: -45 }}
             animate={{ scale: 1, opacity: 1, rotate: 0 }}
             exit={{ scale: 0.5, opacity: 0, rotate: 45 }}
-            transition={{ duration: 0.2 }}
+            transition={iconTransition}
             xmlns="http://www.w3.org/2000/svg"
             fill="none"
             viewBox="0 0 24 24"
@@ -143,7 +146,7 @@ export default function ThemeToggle() {
             initial={{ scale: 0.5, opacity: 0, rotate: -45 }}
             animate={{ scale: 1, opacity: 1, rotate: 0 }}
             exit={{ scale: 0.5, opacity: 0, rotate: 45 }}
-            transition={{ duration: 0.2 }}
+            transition={iconTransition}
             xmlns="http://www.w3.org/2000/svg"
             fill="none"
             viewBox="0 0 24 24"
@@ -163,7 +166,7 @@ export default function ThemeToggle() {
             initial={{ scale: 0.5, opacity: 0, rotate: -45 }}
             animate={{ scale: 1, opacity: 1, rotate: 0 }}
             exit={{ scale: 0.5, opacity: 0, rotate: 45 }}
-            transition={{ duration: 0.2 }}
+            transition={iconTransition}
             className="relative flex items-center justify-center"
           >
             <svg
@@ -194,6 +197,7 @@ export default function ThemeToggle() {
       <div id="theme-description" className="sr-only">
         Use this button to cycle through light, dark, and system themes. The system theme follows your device preference.
       </div>
+      </button>
     </>
   );
 }
